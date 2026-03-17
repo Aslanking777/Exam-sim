@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Greenbook Practice</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand__title">Greenbook Practice</div>
+          <div class="brand__sub" id="testMeta">Loading…</div>
+        </div>
+        <div class="topbar__right">
+          <div class="pill" id="sectionPill">—</div>
+          <div class="timer" id="timer">--:--</div>
+        </div>
+      </header>
+
+      <main class="main">
+        <section id="screenLoading" class="screen is-active">
+          <div class="card">
+            <h2>Loading test</h2>
+            <p id="loadingHint">Fetching questions…</p>
+            <div class="spinner"></div>
+          </div>
+        </section>
+
+        <section id="screenPreReview" class="screen">
+          <div class="card">
+            <h2>Review &amp; Edit</h2>
+            <p>
+              Some questions were flagged as low confidence. You can fix typos before starting. This screen does
+              <strong>not</strong> reveal answers.
+            </p>
+            <div id="reviewList" class="reviewList"></div>
+            <div class="actions">
+              <button class="btn" id="btnStartTest">Start test</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="screenBreak" class="screen">
+          <div class="card">
+            <h2>Break</h2>
+            <p>Mandatory 15-minute break. When the timer hits 0, you’ll continue automatically.</p>
+            <div class="breakTimer" id="breakTimer">15:00</div>
+            <div class="actions">
+              <button class="btn btn--ghost" id="btnSkipBreak">Skip (practice mode)</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="screenTest" class="screen">
+          <div class="layout">
+            <aside class="left">
+              <div class="panel">
+                <div class="panel__title">Review Bridge</div>
+                <div id="bridge" class="bridge"></div>
+              </div>
+
+              <div class="panel" id="toolsPanel">
+                <div class="panel__title">Tools</div>
+                <div class="tools">
+                  <button class="toolBtn" id="btnHighlight">Highlight (EBRW)</button>
+                  <button class="toolBtn" id="btnDesmos">Calculator (Math)</button>
+                </div>
+              </div>
+
+              <div class="panel" id="desmosPanel" hidden>
+                <div class="panel__title panel__title--row">
+                  <span>Desmos</span>
+                  <button class="xBtn" id="btnCloseDesmos">Close</button>
+                </div>
+                <iframe
+                  title="Desmos Calculator"
+                  src="https://www.desmos.com/calculator"
+                  class="desmos"
+                  referrerpolicy="no-referrer"
+                ></iframe>
+              </div>
+            </aside>
+
+            <section class="right">
+              <div class="qTop">
+                <div class="qMeta" id="qMeta">Question —</div>
+                <div class="qTop__actions">
+                  <button class="btn btn--ghost" id="btnSubmitModule">Submit Module</button>
+                </div>
+              </div>
+
+              <div class="questionCard">
+                <div id="qStem" class="stem"></div>
+                <div id="qOptions" class="options"></div>
+              </div>
+
+              <div class="nav">
+                <button class="btn btn--ghost" id="btnPrev">Prev</button>
+                <button class="btn" id="btnNext">Next</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section id="screenDone" class="screen">
+          <div class="card">
+            <h2>Test complete</h2>
+            <p id="doneSummary">Sending report…</p>
+            <div class="actions">
+              <button class="btn" id="btnSendNow">Send report to Telegram</button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <div class="footer__left" id="lockHint"></div>
+        <div class="footer__right"></div>
+      </footer>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
+
