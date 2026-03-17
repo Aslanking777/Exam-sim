@@ -5,7 +5,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any
 
 import aiosqlite
 from aiohttp import web
@@ -52,13 +52,17 @@ def safe_int(x: Any, default: int = 0) -> int:
         return default
 
 
+PARSE_SECONDS_PER_QUESTION = safe_int(os.environ.get("SECONDS_PER_QUESTION", "90"), 90)
+
+
 @dataclass
 class ParsedQuestion:
-    stem: str
+    passage: str
+    question: str
     options: list[str]
     correct_answer: str
-    confidence_score: int
-    status: Literal["ok", "needs_correction"]
+    requires_image_crop: bool
+    image_path: str | None
 
 
 async def init_db() -> None:
@@ -71,6 +75,7 @@ async def init_db() -> None:
               created_at TEXT NOT NULL,
               title TEXT,
               status TEXT NOT NULL,
+              total_time INTEGER,
               raw_json TEXT NOT NULL
             )
             """
@@ -82,10 +87,25 @@ async def init_db() -> None:
               test_id INTEGER NOT NULL,
               idx INTEGER NOT NULL,
               stem TEXT NOT NULL,
+              passage TEXT,
+              question TEXT,
               options_json TEXT NOT NULL,
               correct_answer TEXT NOT NULL,
-              confidence_score INTEGER NOT NULL,
-              status TEXT NOT NULL,
+              requires_image_crop INTEGER NOT NULL DEFAULT 0,
+              image_path TEXT,
+              confidence_score INTEGER NOT NULL DEFAULT 100,
+              status TEXT NOT NULL DEFAULT 'ok',
+              FOREIGN KEY(test_id) REFERENCES tests(id)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS test_files (
+              test_id INTEGER PRIMARY KEY,
+              filename TEXT,
+              mime_type TEXT,
+              data BLOB NOT NULL,
               FOREIGN KEY(test_id) REFERENCES tests(id)
             )
             """
@@ -127,30 +147,57 @@ async def init_db() -> None:
             )
             """
         )
+
+        # Lightweight migrations for existing DBs (safe on repeated runs)
+        async def _col_exists(table: str, col: str) -> bool:
+            rows = await db.execute_fetchall(f"PRAGMA table_info({table})")
+            return any(r[1] == col for r in rows)
+
+        if not await _col_exists("tests", "total_time"):
+            await db.execute("ALTER TABLE tests ADD COLUMN total_time INTEGER")
+
+        for col, ddl in [
+            ("stem", "ALTER TABLE questions ADD COLUMN stem TEXT NOT NULL DEFAULT ''"),
+            ("passage", "ALTER TABLE questions ADD COLUMN passage TEXT"),
+            ("question", "ALTER TABLE questions ADD COLUMN question TEXT"),
+            ("requires_image_crop", "ALTER TABLE questions ADD COLUMN requires_image_crop INTEGER NOT NULL DEFAULT 0"),
+            ("image_path", "ALTER TABLE questions ADD COLUMN image_path TEXT"),
+        ]:
+            if not await _col_exists("questions", col):
+                await db.execute(ddl)
+
         await db.commit()
 
 
-PARSER_PROMPT = """You are parsing SAT questions from a PDF or image.
+PARSER_PROMPT = """You are a specialized SAT/IELTS Document Extraction Engine. 
+Your sole objective is to analyze cropped images of exam questions and convert them into a machine-readable JSON format for a digital simulation interface.
 
-Extract questions, options, and correct answers.
-Return JSON only, with this exact shape:
+STRICT OPERATIONAL PROTOCOLS:
+1. OUTPUT FORMAT: Respond ONLY with a valid, raw JSON object. 
+   - DO NOT use markdown code blocks (no ```json).
+   - DO NOT include introductory or concluding remarks.
+2. CROP CONTEXT: The input image is a crop. Focus on the central content. Ignore peripheral noise, UI elements, or fragments of adjacent questions.
+3. EXTRACTION FIELDS:
+   - "passage": The full reading context or setup text. Use \\n for paragraph breaks.
+
+   - "question": The specific question or prompt being asked.
+   - "options": An array of exactly 4 strings (A, B, C, D). For grid-in math questions, return an empty array [].
+   - "correct_answer": The correct option (A, B, C, or D). If grid-in, return the numerical answer.
+   - "requires_image_crop": Set to TRUE if the content contains complex math symbols (fractions, roots), geometry, graphs, tables, or diagrams that cannot be perfectly rendered in plain text. Set to FALSE for standard text-only questions.
+4. NO ALTERATIONS: Do not solve the question. Do not summarize. Extract the text exactly as it appears.
+
+JSON SCHEMA:
 {
-  "title": "optional string",
   "questions": [
     {
-      "stem": "string",
-      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
-      "correct_answer": "A|B|C|D",
-      "confidence_score": 0-100,
-      "status": "ok|needs_correction"
+      "passage": "string",
+      "question": "string",
+      "options": ["string", "string", "string", "string"],
+      "correct_answer": "string",
+      "requires_image_crop": boolean
     }
   ]
-}
-
-For each question, provide a confidence_score (0-100).
-If the text is blurry or uncertain, flag it with status: "needs_correction".
-Do not spoil the answer in the warning text (and do not add any extra fields).
-"""
+}"""
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -158,11 +205,10 @@ def _extract_json(text: str) -> dict[str, Any]:
     The model sometimes wraps JSON in code fences or adds extra text.
     We aggressively extract the first top-level JSON object.
     """
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
+    text = (text or "").strip()
+    # Strip common markdown code fences even if the model violates instructions
+    text = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```", "", text)
 
     # Fast path
     try:
@@ -253,53 +299,80 @@ def normalize_questions(payload: dict[str, Any]) -> tuple[str | None, list[Parse
     questions = payload.get("questions", [])
     out: list[ParsedQuestion] = []
     for q in questions:
-        stem = str(q.get("stem", "")).strip()
+        passage = str(q.get("passage", "")).strip()
+        question = str(q.get("question", "")).strip()
         options = q.get("options", [])
         if not isinstance(options, list):
             options = []
         options = [str(o).strip() for o in options if str(o).strip()]
-        correct = str(q.get("correct_answer", "")).strip().upper()
-        correct = correct[:1] if correct else ""
-        conf = safe_int(q.get("confidence_score", 0), 0)
-        conf = max(0, min(100, conf))
-        status = str(q.get("status", "ok")).strip()
-        if status not in ("ok", "needs_correction"):
-            status = "ok"
-        if stem and options and correct in ("A", "B", "C", "D"):
+        correct = str(q.get("correct_answer", "")).strip()
+        requires_image_crop = bool(q.get("requires_image_crop", False))
+
+        # Options must be exactly 4 strings, or [] for grid-in.
+        if len(options) == 0:
+            norm_opts: list[str] = []
+        else:
+            norm_opts = options[:4]
+            if len(norm_opts) != 4:
+                norm_opts = []
+
+        if (passage or question) and correct:
             out.append(
                 ParsedQuestion(
-                    stem=stem,
-                    options=options,
+                    passage=passage,
+                    question=question,
+                    options=norm_opts,
                     correct_answer=correct,
-                    confidence_score=conf,
-                    status=status,  # type: ignore[assignment]
+                    requires_image_crop=requires_image_crop,
+                    image_path=None,
                 )
             )
     return (str(title).strip() if isinstance(title, str) and title.strip() else None, out)
 
 
-async def db_insert_test(user_id: int, title: str | None, raw_json: dict[str, Any], questions: list[ParsedQuestion]) -> int:
+async def db_insert_test(
+    user_id: int,
+    title: str | None,
+    raw_json: dict[str, Any],
+    questions: list[ParsedQuestion],
+    *,
+    total_time: int,
+    uploaded_file: tuple[str, str, bytes] | None,
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO tests (user_id, created_at, title, status, raw_json) VALUES (?, ?, ?, ?, ?)",
-            (user_id, utc_now_iso(), title, "parsed", json.dumps(raw_json, ensure_ascii=False)),
+            "INSERT INTO tests (user_id, created_at, title, status, total_time, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, utc_now_iso(), title, "parsed", int(total_time), json.dumps(raw_json, ensure_ascii=False)),
         )
         test_id = cur.lastrowid
+
+        if uploaded_file:
+            filename, mime_type, data = uploaded_file
+            await db.execute(
+                "INSERT OR REPLACE INTO test_files (test_id, filename, mime_type, data) VALUES (?, ?, ?, ?)",
+                (test_id, filename, mime_type, data),
+            )
+
         for idx, q in enumerate(questions, start=1):
+            stem = (q.passage + ("\n\n" if q.passage and q.question else "") + q.question).strip()
             await db.execute(
                 """
                 INSERT INTO questions
-                  (test_id, idx, stem, options_json, correct_answer, confidence_score, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                  (test_id, idx, stem, passage, question, options_json, correct_answer, requires_image_crop, image_path, confidence_score, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     test_id,
                     idx,
-                    q.stem,
+                    stem,
+                    q.passage,
+                    q.question,
                     json.dumps(q.options, ensure_ascii=False),
                     q.correct_answer,
-                    q.confidence_score,
-                    q.status,
+                    1 if q.requires_image_crop else 0,
+                    q.image_path,
+                    100,
+                    "ok",
                 ),
             )
         await db.commit()
@@ -309,14 +382,15 @@ async def db_insert_test(user_id: int, title: str | None, raw_json: dict[str, An
 async def db_get_test(test_id: int) -> dict[str, Any] | None:
     async with aiosqlite.connect(DB_PATH) as db:
         test_row = await db.execute_fetchone(
-            "SELECT id, user_id, created_at, title, status FROM tests WHERE id = ?",
+            "SELECT id, user_id, created_at, title, status, total_time FROM tests WHERE id = ?",
             (test_id,),
         )
         if not test_row:
             return None
+        has_file = await db.execute_fetchone("SELECT 1 FROM test_files WHERE test_id = ? LIMIT 1", (test_id,))
         q_rows = await db.execute_fetchall(
             """
-            SELECT id, idx, stem, options_json, correct_answer, confidence_score, status
+            SELECT id, idx, stem, passage, question, options_json, correct_answer, requires_image_crop, image_path, confidence_score, status
             FROM questions
             WHERE test_id = ?
             ORDER BY idx ASC
@@ -324,24 +398,39 @@ async def db_get_test(test_id: int) -> dict[str, Any] | None:
             (test_id,),
         )
         questions: list[dict[str, Any]] = []
-        for (qid, idx, stem, options_json, correct, conf, status) in q_rows:
+        for (qid, idx, stem, passage, question, options_json, correct, requires_img, image_path, conf, status) in q_rows:
+            passage_s = (passage or "").strip()
+            question_s = (question or "").strip()
+            stem_s = (stem or "").strip()
+            if not passage_s and not question_s and stem_s:
+                # Backward compatibility: older rows stored everything in stem.
+                question_s = stem_s
             questions.append(
                 {
                     "id": qid,
                     "idx": idx,
-                    "stem": stem,
+                    "stem": stem_s or (passage_s + ("\n\n" if passage_s and question_s else "") + question_s).strip(),
+                    "passage": passage_s,
+                    "question": question_s,
                     "options": json.loads(options_json),
                     "correct_answer": correct,
+                    "requires_image_crop": bool(requires_img),
+                    "image_path": image_path
+                    or (f"/api/test_file/{test_id}" if requires_img and has_file else None),
                     "confidence_score": conf,
                     "status": status,
                 }
             )
+        total_time = safe_int(test_row[5], 0)
+        if total_time <= 0:
+            total_time = len(questions) * PARSE_SECONDS_PER_QUESTION
         return {
             "id": test_row[0],
             "user_id": test_row[1],
             "created_at": test_row[2],
             "title": test_row[3],
             "status": test_row[4],
+            "total_time": total_time,
             "questions": questions,
         }
 
@@ -455,20 +544,41 @@ async def handle_upload(message: Message, bot: Bot) -> None:
         except Exception:
             pass
 
-    test_id = await db_insert_test(message.from_user.id, title, parsed, questions)
+    total_time = len(questions) * PARSE_SECONDS_PER_QUESTION
+
+    lower = filename.lower()
+    uploaded_file: tuple[str, str, bytes] | None = None
+    if lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")) or photo:
+        mime = "image/jpeg"
+        if lower.endswith(".png"):
+            mime = "image/png"
+        elif lower.endswith(".webp"):
+            mime = "image/webp"
+        elif lower.endswith(".gif"):
+            mime = "image/gif"
+        uploaded_file = (filename, mime, raw_bytes)
+
+    test_id = await db_insert_test(
+        message.from_user.id,
+        title,
+        parsed,
+        questions,
+        total_time=total_time,
+        uploaded_file=uploaded_file,
+    )
 
     public_api = os.environ.get("PUBLIC_API_BASE", "").strip()
     webapp = os.environ.get("WEBAPP_URL", "").strip() or "https://example.com/"
     if public_api:
-        url = f"{webapp}?test_id={test_id}&api={public_api}"
+        url = f"{webapp}?test_id={test_id}&api={public_api}&total_time={total_time}"
     else:
         # The web app needs an API base to fetch the test.
-        url = f"{webapp}?test_id={test_id}"
+        url = f"{webapp}?test_id={test_id}&total_time={total_time}"
 
-    low_conf = sum(1 for q in questions if q.status == "needs_correction" or q.confidence_score < 60)
+    mm = total_time // 60
+    ss = total_time % 60
     await message.answer(
-        f"Parsed test #{test_id} with {len(questions)} questions.\n"
-        f"Flagged for review: {low_conf}.",
+        f"Ready: {len(questions)} questions.\nTime: {mm:02d}:{ss:02d}.",
         reply_markup=build_webapp_kb(url),
     )
 
@@ -497,6 +607,20 @@ async def api_get_test(request: web.Request) -> web.Response:
     return web.json_response(test)
 
 
+async def api_get_test_file(request: web.Request) -> web.Response:
+    test_id = safe_int(request.match_info.get("test_id"))
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await db.execute_fetchone(
+            "SELECT filename, mime_type, data FROM test_files WHERE test_id = ?",
+            (test_id,),
+        )
+        if not row:
+            return web.Response(status=404, text="not_found")
+        filename, mime_type, data = row
+        headers = {"Content-Disposition": f'inline; filename="{filename or "crop"}"'}
+        return web.Response(body=data, content_type=(mime_type or "application/octet-stream"), headers=headers)
+
+
 async def api_health(_: web.Request) -> web.Response:
     return web.json_response({"ok": True, "time": utc_now_iso()})
 
@@ -505,6 +629,7 @@ def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", api_health)
     app.router.add_get("/api/test/{test_id}", api_get_test)
+    app.router.add_get("/api/test_file/{test_id}", api_get_test_file)
 
     # Very permissive CORS for quick GitHub Pages testing
     async def add_cors_headers(request: web.Request, response: web.StreamResponse) -> web.StreamResponse:

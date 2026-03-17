@@ -32,13 +32,7 @@ function fmtTime(sec) {
   return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
 }
 
-const FLOW = [
-  { key: "EBRW", module: 1, questions: 27, seconds: 32 * 60 },
-  { key: "EBRW", module: 2, questions: 27, seconds: 32 * 60 },
-  { key: "BREAK", module: 0, questions: 0, seconds: 15 * 60 },
-  { key: "MATH", module: 1, questions: 22, seconds: 35 * 60 },
-  { key: "MATH", module: 2, questions: 22, seconds: 35 * 60 },
-];
+let FLOW = [];
 
 let apiBase = (qs("api") || "").replace(/\/+$/, "");
 let testId = Number(qs("test_id") || "0");
@@ -65,21 +59,26 @@ function currentStep() {
 }
 
 function isMathStep(step) {
-  return step.key === "MATH";
+  return step?.key === "MATH";
 }
 
 function isEbrwStep(step) {
-  return step.key === "EBRW";
+  return step?.key === "EBRW";
 }
 
 function isBreakStep(step) {
-  return step.key === "BREAK";
+  return step?.key === "BREAK";
 }
 
 function updateTopbar() {
   const step = currentStep();
   const pill = $("sectionPill");
+  if (!step) {
+    pill.textContent = "—";
+    return;
+  }
   if (isBreakStep(step)) pill.textContent = "BREAK";
+  else if (step.key === "GREENBOOK") pill.textContent = "GREENBOOK • Practice";
   else pill.textContent = `${step.key} • Module ${step.module}`;
 }
 
@@ -134,6 +133,14 @@ function renderTools() {
   const btnHighlight = $("btnHighlight");
   const desmosPanel = $("desmosPanel");
 
+  // Greenbook mode: keep UI clean (no fixed SAT tools)
+  if (step?.key === "GREENBOOK") {
+    btnDesmos.style.display = "none";
+    btnHighlight.style.display = "none";
+    desmosPanel.hidden = true;
+    return;
+  }
+
   btnDesmos.disabled = !isMathStep(step);
   btnDesmos.style.display = isMathStep(step) ? "inline-flex" : "none";
   desmosPanel.hidden = true;
@@ -141,6 +148,15 @@ function renderTools() {
   btnHighlight.disabled = !isEbrwStep(step);
   btnHighlight.style.display = isEbrwStep(step) ? "inline-flex" : "none";
   btnHighlight.classList.toggle("is-on", state.highlightMode);
+}
+
+function resolveAssetUrl(pathOrUrl) {
+  if (!pathOrUrl) return "";
+  const s = String(pathOrUrl);
+  if (/^https?:\/\//i.test(s)) return s;
+  if (!apiBase) return s;
+  if (s.startsWith("/")) return `${apiBase}${s}`;
+  return `${apiBase}/${s}`;
 }
 
 function renderQuestion() {
@@ -151,7 +167,9 @@ function renderQuestion() {
   const q = activeQuestion();
   $("qMeta").textContent = isBreakStep(step)
     ? "Break"
-    : `${step.key} • Module ${step.module} • Question ${state.qIdxInModule + 1} of ${step.questions}`;
+    : step?.key === "GREENBOOK"
+      ? `Question ${state.qIdxInModule + 1} of ${step.questions}`
+      : `${step.key} • Module ${step.module} • Question ${state.qIdxInModule + 1} of ${step.questions}`;
 
   $("qStem").innerHTML = "";
   $("qOptions").innerHTML = "";
@@ -161,13 +179,50 @@ function renderQuestion() {
 
   if (!q) return;
 
-  // Render stem as text but allow highlighting spans
-  const stem = document.createElement("div");
-  stem.textContent = q.stem;
-  $("qStem").appendChild(stem);
+  // Hybrid rendering: show original crop for complex visuals
+  if (q.requires_image_crop) {
+    const img = document.createElement("img");
+    img.alt = `Question ${q.idx || state.qIdxInModule + 1}`;
+    img.src = resolveAssetUrl(q.image_path);
+    img.style.width = "100%";
+    img.style.borderRadius = "12px";
+    img.style.border = "1px solid rgba(234,240,255,.10)";
+    $("qStem").appendChild(img);
+  } else {
+    const text = (q.stem || [q.passage, q.question].filter(Boolean).join("\n\n")).trim();
+    const stem = document.createElement("div");
+    stem.textContent = text;
+    $("qStem").appendChild(stem);
+  }
+
+  // Options: MCQ (4) or grid-in ([])
+  const opts = Array.isArray(q.options) ? q.options : [];
+  if (opts.length === 0) {
+    const wrap = document.createElement("div");
+    wrap.className = "opt";
+    wrap.style.cursor = "default";
+    const k = document.createElement("div");
+    k.className = "opt__key";
+    k.textContent = "Answer";
+    const t = document.createElement("div");
+    t.className = "opt__text";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Type your answer";
+    input.value = state.answers[q.id] || "";
+    input.addEventListener("input", () => {
+      if (state.moduleLocked[state.stepIdx]) return;
+      state.answers[q.id] = input.value;
+    });
+    t.appendChild(input);
+    wrap.appendChild(k);
+    wrap.appendChild(t);
+    $("qOptions").appendChild(wrap);
+    return;
+  }
 
   const selected = state.answers[q.id] || null;
-  q.options.forEach((optText, i) => {
+  opts.slice(0, 4).forEach((optText, i) => {
     const key = ["A", "B", "C", "D"][i] || String(i + 1);
     const el = document.createElement("div");
     el.className = "opt";
@@ -252,7 +307,13 @@ function showTest() {
 function computeScore() {
   let score = 0;
   state.test.questions.forEach((q) => {
-    if (state.answers[q.id] && state.answers[q.id] === q.correct_answer) score += 1;
+    const a = state.answers[q.id];
+    if (a == null) return;
+    if (Array.isArray(q.options) && q.options.length === 0) {
+      if (String(a).trim() === String(q.correct_answer).trim()) score += 1;
+    } else if (a === q.correct_answer) {
+      score += 1;
+    }
   });
   return score;
 }
@@ -436,16 +497,12 @@ async function boot() {
     const t = await loadTest();
     state.test = t;
     setMeta();
-    const flagged = t.questions.filter((q) => q.status === "needs_correction" || (q.confidence_score || 0) < 60);
-    if (flagged.length) {
-      buildPreReviewList(flagged);
-      showScreen("preReview");
-      $("timer").textContent = "--:--";
-      $("sectionPill").textContent = "PRE-REVIEW";
-    } else {
-      state.qEnterTs = Date.now();
-      showTest();
-    }
+    const totalTime = Number(qs("total_time") || t.total_time || (t.questions?.length || 0) * 90) || 0;
+    FLOW = [{ key: "GREENBOOK", module: 1, questions: t.questions.length, seconds: totalTime }];
+    state.stepIdx = 0;
+    state.qIdxInModule = 0;
+    state.qEnterTs = Date.now();
+    showTest();
   } catch (e) {
     $("loadingHint").textContent =
       `Could not load test.\n` +
